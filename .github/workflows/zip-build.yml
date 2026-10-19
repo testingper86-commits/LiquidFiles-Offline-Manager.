@@ -15,33 +15,34 @@ concurrency:
 jobs:
   build:
     name: Extract project ZIP and build debug APK
-    runs-on: ubuntu-latest
+    # Pinned on purpose: ubuntu-latest started moving to Ubuntu 26 on Oct 19, 2026,
+    # which can break the Android SDK setup action.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
-      - name: Checkout ZIP repository
+      - name: Checkout repository (contains the ZIP)
         uses: actions/checkout@v4
 
-      # IMPORTANT: Do not enable setup-java's Gradle cache here. It scans the
-      # checked-out repository for Gradle files before the ZIP has been extracted.
       - name: Locate and extract Android project ZIP
         id: extract
         shell: bash
         run: |
           set -euo pipefail
-          echo 'Files currently in repository:'
-          find . -maxdepth 3 -type f -print | sort | head -200
+          echo 'Files in repository:'
+          find . -maxdepth 3 -type f -not -path './.git/*' | sort | head -100
 
-          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -print -quit)"
+          ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' | sort | head -1)"
           if [[ -z "$ZIP_FILE" ]]; then
-            echo 'ERROR: No .zip file was found in the repository (searched root and 2 subfolder levels).'
-            echo 'Upload the Android project ZIP to the repository and commit it.'
+            echo '::error::No .zip file found in the repository. Commit the Android project ZIP.'
             exit 1
           fi
           echo "Using archive: $ZIP_FILE"
+
           EXTRACT_DIR="$RUNNER_TEMP/liquidfiles-extracted"
-          mkdir -p "$EXTRACT_DIR"
+          rm -rf "$EXTRACT_DIR" && mkdir -p "$EXTRACT_DIR"
           unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
 
-          # Locate the actual project root by its Gradle wrapper and settings file.
+          # Project root = folder that has gradlew AND a settings file.
           PROJECT_DIR=''
           while IFS= read -r -d '' WRAPPER; do
             CANDIDATE="$(dirname "$WRAPPER")"
@@ -52,56 +53,59 @@ jobs:
           done < <(find "$EXTRACT_DIR" -type f -name gradlew -print0)
 
           if [[ -z "$PROJECT_DIR" ]]; then
-            echo 'ERROR: No valid Gradle project root found in the ZIP.'
-            echo 'Expected gradlew and settings.gradle or settings.gradle.kts in the same project directory.'
-            echo 'Archive file listing:'
-            find "$EXTRACT_DIR" -maxdepth 5 -type f -print | sort | head -250
+            echo '::error::No Gradle project root (gradlew + settings.gradle[.kts]) found inside the ZIP.'
+            find "$EXTRACT_DIR" -maxdepth 5 -type f | sort | head -200
             exit 1
           fi
 
           for REQUIRED in \
-            "$PROJECT_DIR/gradlew" \
             "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" \
-            "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" \
-            "$PROJECT_DIR/app/build.gradle.kts"; do
+            "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties"; do
             if [[ ! -s "$REQUIRED" ]]; then
-              echo "ERROR: Required Android/Gradle file is missing: $REQUIRED"
+              echo "::error::Missing required file in ZIP: $REQUIRED"
               exit 1
             fi
           done
 
+          # Accept Groovy or Kotlin DSL for the app module.
+          if ! ls "$PROJECT_DIR"/app/build.gradle* >/dev/null 2>&1; then
+            echo '::error::app/build.gradle(.kts) not found in the ZIP.'
+            exit 1
+          fi
+
           chmod +x "$PROJECT_DIR/gradlew"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Project root verified: $PROJECT_DIR"
-          echo 'Gradle files found:'
-          find "$PROJECT_DIR" -maxdepth 3 \( -name 'settings.gradle*' -o -name 'build.gradle*' -o -name 'gradle-wrapper.properties' \) -type f -print | sort
+          echo "Project root: $PROJECT_DIR"
 
+      # No Gradle cache option here: the project lives in the ZIP, not in the
+      # checkout, so setup-java's cache scan would fail.
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          # Intentionally no cache: gradle. The source project lives inside the ZIP,
-          # not in the repository checkout, and setup-java cache scanning fails otherwise.
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
 
-      - name: Run project smoke tests when available
+      - name: Install SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Run project smoke tests (if included)
         shell: bash
         env:
           PROJECT_DIR: ${{ steps.extract.outputs.project_dir }}
         run: |
           set -euo pipefail
           if [[ -f "$PROJECT_DIR/tools/project_smoke_test.py" ]]; then
-            python3 "$PROJECT_DIR/tools/project_smoke_test.py"
+            cd "$PROJECT_DIR"
+            python3 tools/project_smoke_test.py
           else
-            echo 'No project smoke-test script included; skipping this optional check.'
+            echo 'No smoke-test script in project; skipping.'
           fi
 
       - name: Build debug APK
@@ -120,3 +124,14 @@ jobs:
           path: ${{ steps.extract.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload Gradle reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-failure-reports
+          path: |
+            ${{ steps.extract.outputs.project_dir }}/app/build/reports
+            ${{ steps.extract.outputs.project_dir }}/build/reports
+          if-no-files-found: ignore
+          retention-days: 7
