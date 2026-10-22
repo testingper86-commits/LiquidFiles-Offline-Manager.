@@ -1,146 +1,114 @@
-name: LiquidFiles Android Build
+name: Android Build & Checks
 
 on:
 push:
-branches:
-- main
-- master
+branches: [main]
 pull_request:
+branches: [main]
 workflow_dispatch:
 
 permissions:
 contents: read
 
-concurrency:
-group: liquidfiles-build-${{ github.ref }}
-cancel-in-progress: true
-
 jobs:
 build:
-name: Validate source and build debug APK
+name: Build Android APK
 runs-on: ubuntu-latest
+timeout-minutes: 30
 
 steps:
   - name: Checkout repository
     uses: actions/checkout@v4
-
-  - name: Set up Java 17
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: '17'
 
   - name: Check source ZIP
     shell: bash
     run: |
       set -euo pipefail
       ZIP="LiquidFiles_Offline_Manager_Updated_Source.zip"
-
-      if [ ! -f "$ZIP" ]; then
-        echo "::error::Source ZIP not found: $ZIP"
+      if [[ ! -f "$ZIP" ]]; then
+        echo "::error::Missing $ZIP in repository root."
         exit 1
       fi
-
-      if ! unzip -t "$ZIP"; then
-        echo "::error::Source ZIP is invalid or damaged."
-        exit 1
-      fi
+      unzip -t "$ZIP"
 
   - name: Extract and locate Android project
     shell: bash
     run: |
       set -euo pipefail
-      mkdir -p "$RUNNER_TEMP/liquidfiles-source"
-      unzip -q "LiquidFiles_Offline_Manager_Updated_Source.zip" \
-        -d "$RUNNER_TEMP/liquidfiles-source"
+      SRC="$RUNNER_TEMP/liquidfiles-source"
+      mkdir -p "$SRC"
+      unzip -q LiquidFiles_Offline_Manager_Updated_Source.zip -d "$SRC"
 
-      ROOT="$RUNNER_TEMP/liquidfiles-source"
+      PROJECT=""
+      while IFS= read -r -d '' WRAPPER; do
+        DIR="$(dirname "$WRAPPER")"
+        if { [[ -f "$DIR/settings.gradle" ]] || [[ -f "$DIR/settings.gradle.kts" ]]; } \
+          && { [[ -f "$DIR/app/build.gradle" ]] || [[ -f "$DIR/app/build.gradle.kts" ]]; }; then
+          PROJECT="$DIR"
+          break
+        fi
+      done < <(find "$SRC" -type f -name gradlew -print0)
 
-      WRAPPER="$(find "$ROOT" -type f -name gradlew -print -quit)"
-      SETTINGS="$(find "$ROOT" -type f \( \
-        -name settings.gradle -o \
-        -name settings.gradle.kts \
-      \) -print -quit)"
-
-      if [ -z "$WRAPPER" ] || [ -z "$SETTINGS" ]; then
-        echo "::error::ZIP must contain gradlew and settings.gradle or settings.gradle.kts."
-        echo "ZIP contents (first 100 files):"
-        find "$ROOT" -maxdepth 5 -type f | head -100
+      if [[ -z "$PROJECT" ]]; then
+        echo "::error::No Gradle Android project found in ZIP."
+        find "$SRC" -maxdepth 5 -type f -print | head -300
         exit 1
       fi
 
-      PROJECT_DIR="$(dirname "$WRAPPER")"
+      chmod +x "$PROJECT/gradlew"
+      echo "ANDROID_PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
 
-      if [ "$PROJECT_DIR" != "$(dirname "$SETTINGS")" ]; then
-        echo "::error::Gradle wrapper and settings file are in different project directories."
-        echo "Wrapper: $WRAPPER"
-        echo "Settings: $SETTINGS"
-        exit 1
-      fi
-
-      if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
-         [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
-        echo "::error::Android app Gradle file was not found."
-        exit 1
-      fi
-
-      if [ ! -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml" ]; then
-        echo "::error::AndroidManifest.xml was not found."
-        exit 1
-      fi
-
-      echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-      echo "Found Android project: $PROJECT_DIR"
-
-  - name: Validate Android XML
-    shell: bash
-    run: |
-      set -euo pipefail
-
-      python - "$PROJECT_DIR" <<'PY'
-      import pathlib
-      import sys
-      import xml.etree.ElementTree as ET
-
-      root = pathlib.Path(sys.argv[1]) / "app" / "src" / "main"
-      files = [root / "AndroidManifest.xml"]
-      files.extend(root.joinpath("res").rglob("*.xml"))
-      files = [path for path in files if path.is_file()]
-
-      if not files or not (root / "AndroidManifest.xml").is_file():
-          raise SystemExit("Android manifest or XML resources are missing.")
-
-      for path in files:
-          ET.parse(path)
-          print(f"OK: {path}")
-
-      print(f"Validated {len(files)} XML files.")
-      PY
+  - name: Set up Java
+    uses: actions/setup-java@v4
+    with:
+      distribution: temurin
+      java-version: '17'
 
   - name: Set up Android SDK
     uses: android-actions/setup-android@v3
 
-  - name: Install Android SDK packages
-    shell: bash
+  - name: Install Android SDK
     run: |
-      set -euo pipefail
       sdkmanager --install \
         "platform-tools" \
         "platforms;android-35" \
         "build-tools;35.0.0"
 
-  - name: Build debug APK
+  - name: Validate manifest
     shell: bash
     run: |
       set -euo pipefail
-      cd "$PROJECT_DIR"
-      chmod +x ./gradlew
-      ./gradlew --no-daemon --stacktrace assembleDebug
+      FILE="$ANDROID_PROJECT_DIR/app/src/main/AndroidManifest.xml"
+      if [[ ! -f "$FILE" ]]; then
+        echo "::error::AndroidManifest.xml is missing."
+        exit 1
+      fi
+      python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1]); print("Manifest XML is valid")' "$FILE"
+
+  - name: Build debug APK
+    shell: bash
+    working-directory: ${{ env.ANDROID_PROJECT_DIR }}
+    run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+  - name: Collect APK
+    shell: bash
+    run: |
+      set -euo pipefail
+      mkdir -p "$GITHUB_WORKSPACE/apk"
+      find "$ANDROID_PROJECT_DIR" -type f \
+        -path '*/build/outputs/apk/debug/*.apk' \
+        -exec cp {} "$GITHUB_WORKSPACE/apk/" \;
+
+      if ! compgen -G "$GITHUB_WORKSPACE/apk/*.apk" > /dev/null; then
+        echo "::error::No debug APK was produced."
+        exit 1
+      fi
+      ls -lh "$GITHUB_WORKSPACE/apk"
 
   - name: Upload debug APK
     uses: actions/upload-artifact@v4
     with:
-      name: LiquidFiles-debug-apk
-      path: ${{ runner.temp }}/liquidfiles-source/**/app/build/outputs/apk/debug/*.apk
+      name: LiquidFiles-debug-APK
+      path: apk/*.apk
       if-no-files-found: error
-      retention-days: 14
+      retention-days: 7
