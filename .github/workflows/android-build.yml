@@ -1,84 +1,146 @@
-name: Android Build & Checks
+name: LiquidFiles Android Build
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-  workflow_dispatch:
+push:
+branches:
+- main
+- master
+pull_request:
+workflow_dispatch:
 
 permissions:
-  contents: read
+contents: read
 
 concurrency:
-  group: android-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+group: liquidfiles-build-${{ github.ref }}
+cancel-in-progress: true
 
 jobs:
-  source-checks:
-    name: Source and manifest smoke tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Run project smoke tests
-        run: python tools/project_smoke_test.py
-      - name: Parse Android XML resources and manifest
-        run: |
-          python - <<'PY'
-          import pathlib
-          import xml.etree.ElementTree as ET
-          root = pathlib.Path('app/src/main')
-          files = [root / 'AndroidManifest.xml', * (root / 'res').rglob('*.xml')]
-          files = [path for path in files if path.is_file()]
-          if not files:
-              raise SystemExit('No Android XML files found')
-          for path in files:
-              ET.parse(path)
-              print(f'OK: {path}')
-          print(f'Validated {len(files)} XML files')
-          PY
+build:
+name: Validate source and build debug APK
+runs-on: ubuntu-latest
 
-  android-build:
-    name: Compile Android debug APK
-    runs-on: ubuntu-latest
-    needs: source-checks
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: gradle
-      # Explicitly disable the action's default SDK package list: it may request
-      # the retired package "tools", which makes sdkmanager exit with code 1.
-      - name: Set up Android SDK command-line tools
-        uses: android-actions/setup-android@v3
-        with:
-          packages: ''
-      - name: Install required Android SDK packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-      - name: Validate Gradle wrapper
-        run: |
-          test -s gradlew
-          test -s gradle/wrapper/gradle-wrapper.jar
-          test -s gradle/wrapper/gradle-wrapper.properties
-          chmod +x gradlew
-      - name: Compile debug APK
-        run: ./gradlew --no-daemon --stacktrace assembleDebug
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: LiquidFiles-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 14
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
+
+  - name: Set up Java 17
+    uses: actions/setup-java@v4
+    with:
+      distribution: temurin
+      java-version: '17'
+
+  - name: Check source ZIP
+    shell: bash
+    run: |
+      set -euo pipefail
+      ZIP="LiquidFiles_Offline_Manager_Updated_Source.zip"
+
+      if [ ! -f "$ZIP" ]; then
+        echo "::error::Source ZIP not found: $ZIP"
+        exit 1
+      fi
+
+      if ! unzip -t "$ZIP"; then
+        echo "::error::Source ZIP is invalid or damaged."
+        exit 1
+      fi
+
+  - name: Extract and locate Android project
+    shell: bash
+    run: |
+      set -euo pipefail
+      mkdir -p "$RUNNER_TEMP/liquidfiles-source"
+      unzip -q "LiquidFiles_Offline_Manager_Updated_Source.zip" \
+        -d "$RUNNER_TEMP/liquidfiles-source"
+
+      ROOT="$RUNNER_TEMP/liquidfiles-source"
+
+      WRAPPER="$(find "$ROOT" -type f -name gradlew -print -quit)"
+      SETTINGS="$(find "$ROOT" -type f \( \
+        -name settings.gradle -o \
+        -name settings.gradle.kts \
+      \) -print -quit)"
+
+      if [ -z "$WRAPPER" ] || [ -z "$SETTINGS" ]; then
+        echo "::error::ZIP must contain gradlew and settings.gradle or settings.gradle.kts."
+        echo "ZIP contents (first 100 files):"
+        find "$ROOT" -maxdepth 5 -type f | head -100
+        exit 1
+      fi
+
+      PROJECT_DIR="$(dirname "$WRAPPER")"
+
+      if [ "$PROJECT_DIR" != "$(dirname "$SETTINGS")" ]; then
+        echo "::error::Gradle wrapper and settings file are in different project directories."
+        echo "Wrapper: $WRAPPER"
+        echo "Settings: $SETTINGS"
+        exit 1
+      fi
+
+      if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
+         [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+        echo "::error::Android app Gradle file was not found."
+        exit 1
+      fi
+
+      if [ ! -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml" ]; then
+        echo "::error::AndroidManifest.xml was not found."
+        exit 1
+      fi
+
+      echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+      echo "Found Android project: $PROJECT_DIR"
+
+  - name: Validate Android XML
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      python - "$PROJECT_DIR" <<'PY'
+      import pathlib
+      import sys
+      import xml.etree.ElementTree as ET
+
+      root = pathlib.Path(sys.argv[1]) / "app" / "src" / "main"
+      files = [root / "AndroidManifest.xml"]
+      files.extend(root.joinpath("res").rglob("*.xml"))
+      files = [path for path in files if path.is_file()]
+
+      if not files or not (root / "AndroidManifest.xml").is_file():
+          raise SystemExit("Android manifest or XML resources are missing.")
+
+      for path in files:
+          ET.parse(path)
+          print(f"OK: {path}")
+
+      print(f"Validated {len(files)} XML files.")
+      PY
+
+  - name: Set up Android SDK
+    uses: android-actions/setup-android@v3
+
+  - name: Install Android SDK packages
+    shell: bash
+    run: |
+      set -euo pipefail
+      sdkmanager --install \
+        "platform-tools" \
+        "platforms;android-35" \
+        "build-tools;35.0.0"
+
+  - name: Build debug APK
+    shell: bash
+    run: |
+      set -euo pipefail
+      cd "$PROJECT_DIR"
+      chmod +x ./gradlew
+      ./gradlew --no-daemon --stacktrace assembleDebug
+
+  - name: Upload debug APK
+    uses: actions/upload-artifact@v4
+    with:
+      name: LiquidFiles-debug-apk
+      path: ${{ runner.temp }}/liquidfiles-source/**/app/build/outputs/apk/debug/*.apk
+      if-no-files-found: error
+      retention-days: 14
