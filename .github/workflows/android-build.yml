@@ -23,26 +23,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify source ZIP
+      # Discover the source archive instead of hardcoding its filename.
+      # This prevents failures caused by suffixes such as _FIXED.
+      - name: Find and verify source ZIP
+        id: source_zip
         shell: bash
         run: |
           set -euo pipefail
-          ZIP_FILE="LiquidFiles_Offline_Manager_Updated_Source.zip"
-          if [[ ! -s "$ZIP_FILE" ]]; then
-            echo "::error::Required source archive is missing: $ZIP_FILE"
-            echo "Place the project ZIP in the repository root with this exact filename."
+          mapfile -t ZIP_FILES < <(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name '*.zip' -printf '%f\n' | sort)
+          if [[ "${#ZIP_FILES[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one source ZIP in the repository root; found ${#ZIP_FILES[@]}."
+            printf 'ZIP found: %s\n' "${ZIP_FILES[@]:-none}"
             exit 1
           fi
+          ZIP_FILE="${ZIP_FILES[0]}"
+          echo "Using source archive: $ZIP_FILE"
           unzip -t "$ZIP_FILE"
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Extract and locate Android project
         id: project
         shell: bash
+        env:
+          ZIP_FILE: ${{ steps.source_zip.outputs.zip_file }}
         run: |
           set -euo pipefail
           EXTRACT_DIR="$RUNNER_TEMP/liquidfiles-source"
           mkdir -p "$EXTRACT_DIR"
-          unzip -q "LiquidFiles_Offline_Manager_Updated_Source.zip" -d "$EXTRACT_DIR"
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
           PROJECT_DIR=""
           while IFS= read -r -d '' WRAPPER; do
             CANDIDATE="$(dirname "$WRAPPER")"
@@ -134,4 +142,3 @@ jobs:
           path: ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
-          
